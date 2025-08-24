@@ -63,7 +63,7 @@
             </div>
           </div>
 
-          <!-- NEW: Quartile filter -->
+          <!-- Quartile filter -->
           <div class="flex flex-col">
             <label class="text-xs font-medium text-slate-600">Quartile (Q1–Q4)</label>
             <select id="quartileFilter" class="w-32 px-3 py-2 rounded-xl border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
@@ -73,6 +73,11 @@
               <option value="Q3">Q3</option>
               <option value="Q4">Q4</option>
             </select>
+            <div class="mt-2 flex items-center gap-2">
+              <input type="file" id="sjrFile" accept=".csv,.json" class="hidden" />
+              <button id="loadSjrBtn" class="px-3 py-2 rounded-xl bg-slate-100 text-slate-700 text-xs">Load SJR file</button>
+              <span id="sjrStatus" class="text-[11px] text-slate-500"></span>
+            </div>
           </div>
 
           <!-- Toggles -->
@@ -95,7 +100,10 @@
             <button id="resetBtn" class="px-3 py-2.5 rounded-xl bg-slate-100 text-slate-700 text-sm">Reset</button>
           </div>
         </div>
-        <p class="text-xs text-slate-500 mt-3">Tip: keep 2-4 precise affiliation phrases for best precision. Example: “University of Petroleum and Energy Studies”, “University of Petroleum & Energy Studies”, “UPES”.</p>
+        <p class="text-xs text-slate-500 mt-3">
+          Tip: keep 2-4 precise affiliation phrases. Example: “University of Petroleum and Energy Studies”, “University of Petroleum & Energy Studies”, “UPES”.
+          To enable the quartile filter, add an SJR mapping file (CSV/JSON) via “Load SJR file” or place <code>sjr_quartiles.csv</code> / <code>sjr_quartiles.json</code> in the repo root.
+        </p>
       </div>
 
       <!-- Search & Export Card -->
@@ -106,7 +114,7 @@
           <button id="exportCsv" class="w-full px-3 py-2 rounded-xl bg-emerald-600 text-white text-sm flex items-center justify-center gap-2"><i data-lucide="download"></i> Export CSV</button>
           <button id="exportJson" class="w-full px-3 py-2 rounded-xl bg-emerald-50 text-emerald-700 border border-emerald-200 text-sm">Export JSON</button>
         </div>
-        <p class="text-[11px] text-slate-500 mt-3">Data via Crossref public API. Please set your contact email inside the code (mailto parameter) for responsible use.</p>
+        <p class="text-[11px] text-slate-500 mt-3">Data via Crossref public API. Set your contact email inside the code (mailto parameter) for responsible use.</p>
       </div>
     </div>
   </section>
@@ -164,25 +172,25 @@
 
   <!-- FOOTER -->
   <footer class="text-center text-xs text-slate-500 pb-8">
-    Built for UPES · Data: Crossref · This portal runs entirely in your browser.
+    Built for UPES · Data: Crossref · Quartiles: SJR mapping file (CSV/JSON).
   </footer>
 
   <script>
     const CROSSREF_ENDPOINT = 'https://api.crossref.org/works';
     const CONTACT_EMAIL = 'research@upes.ac.in'; // TODO: change to your email for polite API use
 
-    // --- Quartile mapping (Scopus/SJR-like). Extend this list with your data. ---
-    const quartileMap = {
-      "Renewable Energy": "Q1",
-      "Journal of Cleaner Production": "Q1",
-      "Energy Reports": "Q2",
-      "Sustainability": "Q2",
-      "Environmental Science and Pollution Research": "Q2",
-      "International Journal of Hydrogen Energy": "Q1",
-      "Energy": "Q1",
-      "Fuel": "Q1",
-      "Energy Conversion and Management": "Q1"
-      // Add more: "Exact Journal Title": "Q1|Q2|Q3|Q4"
+    // ------- SJR mapping (will be populated from JSON/CSV, but we keep a tiny starter map) -------
+    let quartileMap = {
+      "renewable energy": "Q1",
+      "journal of cleaner production": "Q1",
+      "energy reports": "Q2",
+      "sustainability": "Q2",
+      "environmental science and pollution research": "Q2",
+      "international journal of hydrogen energy": "Q1",
+      "energy": "Q1",
+      "fuel": "Q1",
+      "energy conversion and management": "Q1"
+      // This will be overridden/extended when a proper mapping file is loaded
     };
 
     const DEFAULT_AFFILIATIONS = [
@@ -199,10 +207,123 @@
       useCache: true,
       data: [],
       filtered: [],
-      charts: {}
+      charts: {},
+      sjrLoaded: false
     };
 
-    // ---------- UI helpers ----------
+    // ----------------------- SJR LOADING (JSON/CSV) -----------------------
+    function normTitle(t) {
+      return (t || '').toString().trim().toLowerCase().replace(/\s+/g,' ');
+    }
+
+    function parseCSV(text) {
+      // Minimal CSV parser (handles quotes, commas, CRLF)
+      const rows = [];
+      let row = [], cell = '', inQuotes = false;
+      for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (ch === '"') {
+          if (inQuotes && text[i+1] === '"') { cell += '"'; i++; }
+          else { inQuotes = !inQuotes; }
+        } else if (ch === ',' && !inQuotes) {
+          row.push(cell); cell = '';
+        } else if ((ch === '\n' || ch === '\r') && !inQuotes) {
+          if (cell !== '' || row.length) { row.push(cell); rows.push(row); row = []; cell = ''; }
+        } else {
+          cell += ch;
+        }
+      }
+      if (cell !== '' || row.length) { row.push(cell); rows.push(row); }
+      return rows;
+    }
+
+    function buildMapFromRows(rows) {
+      if (!rows || rows.length < 2) return {};
+      const header = rows[0].map(h => h.trim().toLowerCase());
+      // Accept common names: Title, Source Title, Journal Title, SJR Best Quartile, Best Quartile, Quartile
+      const titleIdx = header.findIndex(h => /^(title|source title|journal title)$/i.test(h));
+      const qIdx = header.findIndex(h => /(sjr\s*best\s*quartile|best\s*quartile|quartile)/i.test(h));
+      const map = {};
+      if (titleIdx === -1 || qIdx === -1) return map;
+      for (let r = 1; r < rows.length; r++) {
+        const t = rows[r][titleIdx]; const q = rows[r][qIdx];
+        if (!t || !q) continue;
+        const k = normTitle(t);
+        const v = (q || '').toString().toUpperCase().trim();
+        if (/^Q[1-4]$/.test(v)) map[k] = v;
+      }
+      return map;
+    }
+
+    async function tryFetch(url) {
+      try {
+        const res = await fetch(url, { cache: 'no-store' });
+        if (!res.ok) return null;
+        return res;
+      } catch { return null; }
+    }
+
+    async function autoLoadSJR() {
+      // Try JSON first
+      let res = await tryFetch('sjr_quartiles.json');
+      if (res) {
+        const obj = await res.json();
+        Object.entries(obj || {}).forEach(([k, v]) => {
+          const key = normTitle(k); const val = (v||'').toString().toUpperCase();
+          if (/^Q[1-4]$/.test(val)) quartileMap[key] = val;
+        });
+        state.sjrLoaded = true;
+        document.getElementById('sjrStatus').textContent = 'Loaded sjr_quartiles.json';
+        return;
+      }
+      // Then CSV
+      res = await tryFetch('sjr_quartiles.csv');
+      if (res) {
+        const text = await res.text();
+        const rows = parseCSV(text);
+        const map = buildMapFromRows(rows);
+        if (Object.keys(map).length) {
+          quartileMap = { ...quartileMap, ...map };
+          state.sjrLoaded = true;
+          document.getElementById('sjrStatus').textContent = 'Loaded sjr_quartiles.csv';
+        }
+      }
+    }
+
+    function handleSjrUpload(file) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          if (file.name.toLowerCase().endsWith('.json')) {
+            const obj = JSON.parse(reader.result);
+            Object.entries(obj || {}).forEach(([k, v]) => {
+              const key = normTitle(k); const val = (v||'').toString().toUpperCase();
+              if (/^Q[1-4]$/.test(val)) quartileMap[key] = val;
+            });
+            state.sjrLoaded = true;
+            document.getElementById('sjrStatus').textContent = 'Loaded mapping (JSON)';
+          } else {
+            const rows = parseCSV(reader.result);
+            const map = buildMapFromRows(rows);
+            if (Object.keys(map).length) {
+              quartileMap = { ...quartileMap, ...map };
+              state.sjrLoaded = true;
+              document.getElementById('sjrStatus').textContent = 'Loaded mapping (CSV)';
+            } else {
+              document.getElementById('sjrStatus').textContent = 'CSV loaded but no columns detected';
+            }
+          }
+          // recompute quartiles on current data and refresh UI
+          state.data.forEach(x => x.quartile = quartileMap[normTitle(x.journal)] || '');
+          applyAllFiltersAndRender();
+        } catch (e) {
+          document.getElementById('sjrStatus').textContent = 'Failed to parse file';
+        }
+      };
+      reader.readAsText(file);
+    }
+
+    // -------------------- Crossref fetch + transforms --------------------
     function renderAffPills() {
       const wrap = document.getElementById('affPills');
       wrap.innerHTML = '';
@@ -243,20 +364,9 @@
       const subjects = Array.isArray(it.subject) ? it.subject : [];
       const citations = typeof it['is-referenced-by-count'] === 'number' ? it['is-referenced-by-count'] : 0;
       const url = it.URL || (it.DOI ? 'https://doi.org/' + it.DOI : '');
-      const quartile = quartileMap[journal] || ''; // <- NEW
-      return {
-        doi: it.DOI || '',
-        title,
-        authors,
-        authorAffs: affs,
-        journal,
-        year,
-        type: it.type || '',
-        url,
-        subjects,
-        citations,
-        quartile // <- NEW
-      };
+      // Assign quartile from map (case-insensitive)
+      const quartile = quartileMap[normTitle(journal)] || '';
+      return { doi: it.DOI || '', title, authors, authorAffs: affs, journal, year, type: it.type || '', url, subjects, citations, quartile };
     }
 
     function keyForCache() {
@@ -288,7 +398,6 @@
       let cursor = '*';
       let done = false;
       let all = [];
-
       while (!done && all.length < maxItems) {
         const params = new URLSearchParams({
           'query.affiliation': aff,
@@ -336,20 +445,21 @@
       saveCache(state.data);
     }
 
+    // -------------------- UI + charts + table --------------------
     function updateKPIs() {
-      const total = state.filtered.length;
-      const uniqueJournals = new Set(state.filtered.map(x => x.journal).filter(Boolean)).size;
-      const citations = state.filtered.reduce((a, b) => a + (b.citations || 0), 0);
-      const cits = state.filtered.map(x => x.citations || 0).sort((a,b) => b - a);
+      const total = shownRows.length;
+      const uniqueJournals = new Set(shownRows.map(x => x.journal).filter(Boolean)).size;
+      const citations = shownRows.reduce((a, b) => a + (b.citations || 0), 0);
+      const cits = shownRows.map(x => x.citations || 0).sort((a,b) => b - a);
       let h = 0; for (let i=0;i<cits.length;i++){ if (cits[i] >= i+1) h = i+1; else break; }
 
       const grid = document.getElementById('kpiGrid');
       grid.innerHTML = '';
       [
-        { label: 'Total Publications', value: total },
+        { label: 'Total Publications (shown)', value: total },
         { label: 'Unique Journals', value: uniqueJournals },
         { label: 'Total Citations (Crossref)', value: citations },
-        { label: 'h-index (from list)', value: h }
+        { label: 'h-index (from shown)', value: h }
       ].forEach(c => {
         const div = document.createElement('div');
         div.className = 'bg-white rounded-2xl shadow-sm border border-slate-200 p-4';
@@ -364,7 +474,7 @@
 
       // By Year
       const byYear = {};
-      state.filtered.forEach(x => { if (x.year) byYear[x.year] = (byYear[x.year]||0)+1; });
+      shownRows.forEach(x => { if (x.year) byYear[x.year] = (byYear[x.year]||0)+1; });
       const years = Object.keys(byYear).sort();
       state.charts.byYear = new Chart(document.getElementById('chartByYear'), {
         type: 'bar',
@@ -374,7 +484,7 @@
 
       // By Type
       const byType = {};
-      state.filtered.forEach(x => { const t = x.type || 'other'; byType[t] = (byType[t]||0)+1; });
+      shownRows.forEach(x => { const t = x.type || 'other'; byType[t] = (byType[t]||0)+1; });
       const types = Object.keys(byType).sort((a,b)=>byType[b]-byType[a]).slice(0,8);
       state.charts.byType = new Chart(document.getElementById('chartByType'), {
         type: 'doughnut',
@@ -384,7 +494,7 @@
 
       // Top Journals
       const byJ = {};
-      state.filtered.forEach(x => { const j = x.journal || 'Unknown'; byJ[j] = (byJ[j]||0)+1; });
+      shownRows.forEach(x => { const j = x.journal || 'Unknown'; byJ[j] = (byJ[j]||0)+1; });
       const topJ = Object.entries(byJ).sort((a,b)=>b[1]-a[1]).slice(0,10);
       state.charts.topJ = new Chart(document.getElementById('chartTopJournals'), {
         type: 'bar',
@@ -394,7 +504,7 @@
 
       // Top Authors
       const byA = {};
-      state.filtered.forEach(x => x.authors.forEach(a => { byA[a] = (byA[a]||0)+1; }));
+      shownRows.forEach(x => x.authors.forEach(a => { byA[a] = (byA[a]||0)+1; }));
       const topA = Object.entries(byA).sort((a,b)=>b[1]-a[1]).slice(0,10);
       state.charts.topA = new Chart(document.getElementById('chartTopAuthors'), {
         type: 'bar',
@@ -406,6 +516,8 @@
     function escapeHtml(str) {
       return (str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     }
+
+    let shownRows = [];
 
     function renderTable(rows) {
       const body = document.getElementById('pubBody');
@@ -432,24 +544,34 @@
       body.appendChild(frag);
     }
 
-    function applySearchFilter() {
+    function applyAllFiltersAndRender() {
       const q = document.getElementById('searchBox').value.trim().toLowerCase();
       const qQuartile = document.getElementById('quartileFilter').value;
 
-      const rows = state.filtered.filter(r => {
+      // Base set (year range already applied when we created state.filtered)
+      let rows = state.filtered;
+
+      // Re-assign quartiles in case the map has changed since first fetch
+      rows.forEach(r => { r.quartile = quartileMap[normTitle(r.journal)] || r.quartile || ''; });
+
+      // Search + Quartile filter
+      rows = rows.filter(r => {
         const matchSearch = !q
           || (r.title||'').toLowerCase().includes(q)
           || (r.journal||'').toLowerCase().includes(q)
           || r.authors.some(a => a.toLowerCase().includes(q));
-        const matchQuartile = !qQuartile || r.quartile === qQuartile;
+        const matchQuartile = !qQuartile || (r.quartile === qQuartile);
         return matchSearch && matchQuartile;
       });
 
+      shownRows = rows;
       renderTable(rows);
+      updateKPIs();
+      buildCharts();
     }
 
     function sortBy(key, ascending=true) {
-      const sorted = [...state.filtered].sort((a,b) => {
+      const sorted = [...shownRows].sort((a,b) => {
         const na = (a[key] ?? '').toString().toLowerCase();
         const nb = (b[key] ?? '').toString().toLowerCase();
         if (key === 'citations' || key === 'year') return (ascending ? 1 : -1) * ((na - nb));
@@ -457,12 +579,14 @@
         if (na > nb) return ascending ? 1 : -1;
         return 0;
       });
-      state.filtered = sorted;
-      applySearchFilter();
+      shownRows = sorted;
+      renderTable(shownRows);
+      updateKPIs();
+      buildCharts();
     }
 
     function exportCSV() {
-      const rows = (document.getElementById('pubBody').children.length ? state.filtered : []).map(r => ({
+      const rows = shownRows.map(r => ({
         year: r.year || '',
         title: r.title,
         authors: r.authors.join('; '),
@@ -483,7 +607,7 @@
     }
 
     function exportJSON() {
-      const blob = new Blob([JSON.stringify(state.filtered, null, 2)], {type:'application/json'});
+      const blob = new Blob([JSON.stringify(shownRows, null, 2)], {type:'application/json'});
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
       a.download = 'publications.json';
@@ -491,6 +615,7 @@
     }
 
     async function runLoad() {
+      // read UI
       const fy = parseInt(document.getElementById('fromYear').value, 10);
       const ty = parseInt(document.getElementById('toYear').value, 10);
       if (Number.isFinite(fy)) state.fromYear = fy;
@@ -498,15 +623,15 @@
       state.onlyStrictAff = document.getElementById('onlyWithAffInAuthors').checked;
       state.useCache = document.getElementById('useCache').checked;
 
+      // Busy state
       const btn = document.getElementById('loadBtn');
       btn.disabled = true; btn.innerHTML = '<svg class="animate-spin h-4 w-4" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path></svg> Loading…';
 
       try {
         await fetchAll();
+        // filter to year range again (safety)
         state.filtered = state.data.filter(x => x.year && x.year >= state.fromYear && x.year <= state.toYear);
-        updateKPIs();
-        buildCharts();
-        applySearchFilter();
+        applyAllFiltersAndRender();
       } catch (e) {
         alert('Failed to load publications: ' + e.message);
       } finally {
@@ -514,9 +639,12 @@
       }
     }
 
-    document.addEventListener('DOMContentLoaded', () => {
+    // -------------------- Event wiring --------------------
+    document.addEventListener('DOMContentLoaded', async () => {
       setDefaults();
       renderAffPills();
+      await autoLoadSJR(); // try to load sjr_quartiles.json/csv from repo automatically
+      runLoad();
 
       document.getElementById('addAffBtn').onclick = () => {
         const v = document.getElementById('newAff').value.trim();
@@ -539,8 +667,8 @@
       document.getElementById('loadBtn').onclick = runLoad;
       document.getElementById('exportCsv').onclick = exportCSV;
       document.getElementById('exportJson').onclick = exportJSON;
-      document.getElementById('searchBox').addEventListener('input', applySearchFilter);
-      document.getElementById('quartileFilter').addEventListener('change', applySearchFilter);
+      document.getElementById('searchBox').addEventListener('input', applyAllFiltersAndRender);
+      document.getElementById('quartileFilter').addEventListener('change', applyAllFiltersAndRender);
 
       // Sorting handlers
       let sortState = { key: 'year', asc: false };
@@ -552,8 +680,11 @@
         });
       });
 
-      // Auto-load
-      runLoad();
+      // SJR upload
+      document.getElementById('loadSjrBtn').addEventListener('click', () => document.getElementById('sjrFile').click());
+      document.getElementById('sjrFile').addEventListener('change', (e) => {
+        if (e.target.files && e.target.files[0]) handleSjrUpload(e.target.files[0]);
+      });
     });
   </script>
 </body>
